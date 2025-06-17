@@ -9,18 +9,16 @@ from openai import OpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 
-# Configure logging
+# Configure logging to write only to debug.log
 logging.basicConfig(
-    level=logging.ERROR,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('errors.log', encoding='utf-8'),
-        logging.NullHandler()
+        logging.FileHandler('debug.log', encoding='utf-8'),
+        logging.FileHandler('errors.log', encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
-logging.getLogger().addHandler(logging.FileHandler('debug.log', encoding='utf-8'))
-logging.getLogger().setLevel(logging.INFO)
 
 MAX_TOKENS = 2048
 
@@ -43,6 +41,7 @@ class State(TypedDict):
     content_type: str
     file_type: str
     feedback: str
+    chapter: str
 
 summarize_template = PromptTemplate(
     input_variables=['history', 'embeddings', 'query', 'subject'],
@@ -90,7 +89,8 @@ def initialize_state(initial_data: Dict = {}) -> State:
         "chunk_size_tokens": initial_data.get("chunk_size_tokens", 0),
         "content_type": initial_data.get("content_type", ""),
         "file_type": initial_data.get("file_type", ""),
-        "feedback": initial_data.get("feedback", "")
+        "feedback": initial_data.get("feedback", ""),
+        "chapter": initial_data.get("chapter", "")
     }
 
 def detect_topic(state: State) -> State:
@@ -222,25 +222,18 @@ def retrieve_embeddings(state: State) -> State:
         return state
     
     index = pc.Index(index_name)
-
+    
     try:
-        original_query = state['query']
-        llm = ChatGroq(api_key=os.getenv("GROQ_API_KEY"), model_name="llama-3.3-70b-versatile")
-        if state['subject'] in ['maths', 'chemistry']:
-            latex_messages = [
-                {"role": "system", "content": "Convert mathematical or chemical equations to LaTeX format. Keep non-equation text as is, use \\(\\) for inline equations."},
-                {"role": "user", "content": original_query}
-            ]
-            try:
-                latex_response = llm.invoke(latex_messages)
-                state['query'] = latex_response.content.strip()
-                logger.info(f"Raw Query: {original_query}, LaTeX-Converted Query: {state['query']}")
-            except Exception as e:
-                logger.warning(f"Failed to convert query to LaTeX: {e}")
-                state['query'] = original_query
-        
+        # Log index stats for debugging
+        stats = index.describe_index_stats()
+        logger.info(f"Index '{index_name}' Stats: {stats}")
+
+        # Normalize query
+        query_text = state['query'].lower().replace("can you explain", "").strip()
+        logger.info(f"Normalized Query for Embedding: {query_text}")
+
         response = client.embeddings.create(
-            input=state['query'],
+            input=query_text,
             model="text-embedding-3-small"
         )
         query_embedding = response.data[0].embedding
@@ -248,39 +241,30 @@ def retrieve_embeddings(state: State) -> State:
         full_retrieval_modes = {'explain', 'step_by_step'}
         relevant_retrieval_modes = {'summarize', 'brief'}
 
-        current_parent_ids = state.get("parent_paragraph_id", [])
-        current_context_ids = state.get("context_ids", [])
+        filter_dict = {"subject": state['subject'], "file_type": "markdown"}
+        if state['query_type'] != 'new_query':
+            current_parent_ids = state.get("parent_paragraph_id", [])
+            current_context_ids = state.get("context_ids", [])
+            if current_parent_ids:
+                if isinstance(current_parent_ids, list) and len(current_parent_ids) == 1:
+                    filter_dict["parent_paragraph_id"] = current_parent_ids[0]
+                else:
+                    filter_dict["parent_paragraph_id"] = {"$in": current_parent_ids}
+            if current_context_ids:
+                filter_dict["context_ids"] = {"$in": current_context_ids}
 
-        filter_dict = {}
-        if current_parent_ids:
-            if isinstance(current_parent_ids, list) and len(current_parent_ids) == 1:
-                filter_dict["parent_paragraph_id"] = current_parent_ids[0]
-            else:
-                filter_dict["parent_paragraph_id"] = {"$in": current_parent_ids}
-        if current_context_ids:
-            filter_dict["context_ids"] = {"$in": current_context_ids}
-        if state['subject']:
-            filter_dict["subject"] = state['subject']
-
-        logger.info(f"Retrieval Parameters - Query: {state['query']}, Subject: {state['subject']}, Response Type: {state['response_type']}")
+        logger.info(f"Retrieval Parameters - Query: {query_text}, Subject: {state['subject']}, Response Type: {state['response_type']}")
         logger.info(f"Filter Dictionary: {filter_dict}")
 
-        top_k = 3 if state['response_type'] in full_retrieval_modes else 2 if state['response_type'] in relevant_retrieval_modes else 3
-        results = index.query(vector=query_embedding, top_k=top_k, include_metadata=True, filter=filter_dict, namespace='__default__')
+        top_k = 10  # Increased for broader retrieval
+        results = index.query(vector=query_embedding, top_k=top_k, include_metadata=True, filter=filter_dict, namespace='default')
 
         matches = results.get("matches", [])
-        seen_texts = set()
-        deduplicated_matches = []
-        for hit in matches:
-            text = hit.metadata.get('original_text', '')
-            if text not in seen_texts:
-                seen_texts.add(text)
-                deduplicated_matches.append(hit)
-        state["embeddings"] = [{"score": hit.score, **hit.metadata} for hit in deduplicated_matches]
+        state["embeddings"] = [{"score": hit.score, **hit.metadata} for hit in matches]
         
-        logger.info(f"Number of chunks retrieved: {len(deduplicated_matches)}")
-        if deduplicated_matches:
-            for idx, hit in enumerate(deduplicated_matches, 1):
+        logger.info(f"Number of chunks retrieved: {len(matches)}")
+        if matches:
+            for idx, hit in enumerate(matches, 1):
                 metadata = hit.metadata
                 logger.info(f"\nChunk {idx} Details:")
                 logger.info(f"Score: {hit.score}")
@@ -295,6 +279,14 @@ def retrieve_embeddings(state: State) -> State:
                 logger.info("-" * 80)
         else:
             logger.info("No matches retrieved for the query.")
+            # Fallback: Try a broader query
+            broad_query = " ".join(query_text.split()[:2])  # Use first two words for broader match
+            response = client.embeddings.create(input=broad_query, model="text-embedding-3-small")
+            broad_embedding = response.data[0].embedding
+            results = index.query(vector=broad_embedding, top_k=5, include_metadata=True, filter={"subject": state['subject'], "file_type": "markdown"}, namespace='default')
+            matches = results.get("matches", [])
+            state["embeddings"] = [{"score": hit.score, **hit.metadata} for hit in matches]
+            logger.info(f"Fallback query '{broad_query}' retrieved {len(matches)} chunks.")
 
         if state["embeddings"]:
             top_chunk = max(state["embeddings"], key=lambda x: x['score'])
@@ -306,7 +298,7 @@ def retrieve_embeddings(state: State) -> State:
             state['file_type'] = top_chunk.get("file_type", "")
 
     except Exception as e:
-        logger.error(f"Error retrieving embeddings for query '{state['query']}': {e}")
+        logger.error(f"Error retrieving embeddings for query '{query_text}': {e}")
         state['embeddings'] = []
     
     return state
@@ -317,6 +309,7 @@ def decide_next_node(state: State) -> Dict:
 
     history = '\n'.join(state['user_conversation'] + state['ai_conversation'])
     prompt = f"""History: {history}\nQuery: {state['query'].lower()}\nBased on the query and history, decide the next action. Options are: 'summarize', 'explain', 'step_by_step', 'practice', 'brief', 'summarize_existing'. 
+    For queries asking to 'calculate' or 'find' a numerical value, choose 'step_by_step'.
     Respond with only one option."""
 
     try:
@@ -331,15 +324,15 @@ def decide_next_node(state: State) -> Dict:
         next_node = response.content.strip().lower()
         valid_nodes = {'summarize', 'explain', 'step_by_step', 'practice', 'brief', 'summarize_existing'}
 
-        state["response_type"] = next_node if next_node in valid_nodes else 'brief'
+        state["response_type"] = next_node if next_node in valid_nodes else 'step_by_step'
         state["output"] = ""
         logger.info(f"Decided Next Node: {next_node}")
         return {"next_node": state["response_type"]}
     except Exception as e:
         logger.error(f"Error deciding next node for '{state['query']}': {e}")
-        state["response_type"] = 'brief'
+        state["response_type"] = 'step_by_step'
         state["output"] = ""
-        return {"next_node": 'brief'}
+        return {"next_node": 'step_by_step'}
 
 def node_summarize(state: State) -> State:
     load_dotenv()
@@ -347,6 +340,9 @@ def node_summarize(state: State) -> State:
 
     history = "\n".join(state["user_conversation"] + state["ai_conversation"])
     if not state["embeddings"]:
+        if state["output"]:  # Fallback response already set
+            state["ai_conversation"].append(state["output"])
+            return state
         state["output"] = "No relevant content found to summarize."
         state["ai_conversation"].append(state["output"])
         return state
@@ -372,6 +368,9 @@ def node_step_by_step(state: State) -> State:
 
     history = "\n".join(state["user_conversation"] + state["ai_conversation"])
     if not state["embeddings"]:
+        if state["output"]:  # Fallback response already set
+            state["ai_conversation"].append(state["output"])
+            return state
         state["output"] = "No relevant content found for step-by-step solution."
         state["ai_conversation"].append(state["output"])
         return state
@@ -379,7 +378,7 @@ def node_step_by_step(state: State) -> State:
     top_chunk = max(state["embeddings"], key=lambda x: x['score'])
     chunk_text = top_chunk.get("original_text", "")
 
-    prompt = step_by_step_template.format(history=history, embeddings=chunk_text, query=state["query"], subject=state["subject"])
+    prompt = step_by_step_template.format(history=history, embeddings=chunk_text, query=state['query'], subject=state['subject'])
     try:
         response = llm.invoke([{"role": "user", "content": prompt}])
         output = response.content.strip()
@@ -407,7 +406,7 @@ def node_practice(state: State) -> State:
     top_chunk = max(state["embeddings"], key=lambda x: x['score'])
     chunk_text = top_chunk.get("original_text", "")
 
-    prompt = practice_template.format(history=history, embeddings=chunk_text, query=state["query"], subject=state["subject"])
+    prompt = practice_template.format(history=history, embeddings=chunk_text, query=state["query"], subject=state['subject'])
     try:
         response = llm.invoke([{"role": "user", "content": prompt}])
         state["output"] = response.content.strip()
@@ -425,6 +424,9 @@ def node_explain(state: State) -> State:
 
     history = "\n".join(state["user_conversation"] + state["ai_conversation"])
     if not state["embeddings"]:
+        if state["output"]:  # Fallback response already set
+            state["ai_conversation"].append(state["output"])
+            return state
         state["output"] = "No relevant content found to explain."
         state["ai_conversation"].append(state["output"])
         return state
@@ -494,7 +496,7 @@ def create_workflow() -> CompiledStateGraph:
     workflow.add_edge("retrieve_embeddings", "decide_next_node")
 
     def route_next_node(state: State) -> str:
-        return state.get("next_node", "explain")
+        return state.get("next_node", "step_by_step")
 
     workflow.add_conditional_edges(
         "decide_next_node",
@@ -524,18 +526,17 @@ if __name__ == "__main__":
     app = create_workflow()
     
     while True:
-        user_query = input("\nYour question: ").strip()
+        user_query = input("\nYour question: ")
         
         if user_query.lower() == 'exit':
             print("Thank you for using the CBSE curriculum assistant!")
             break
             
         if not user_query:
-            print("Please enter a question.")
+            print("Response: Please enter a question.")
             continue
             
         initial_state = initialize_state({"query": user_query})
         result = app.invoke(initial_state)
         
-        print("\nResponse:", result["output"])
-        
+        print(f"Response: {result['output']}")
