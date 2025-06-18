@@ -55,6 +55,68 @@ brief_template = PromptTemplate(
     Make sure the explanation is precise and understandable for a CBSE student."""
 )
 
+from typing import Dict, TypedDict, List
+import os
+from fastapi import FastAPI
+import logging
+from pinecone import Pinecone
+from dotenv import load_dotenv
+from langchain_groq import ChatGroq
+from langchain.prompts import PromptTemplate
+from pydantic import BaseModel,Field
+class ChatRequest(BaseModel):
+    query: str = Field(..., description="User's query about Jira issues")
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
+from langgraph.graph import StateGraph, END
+from langgraph.graph.state import CompiledStateGraph
+
+# Configure logging to write only to debug.log
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('debug.log', encoding='utf-8'),
+        logging.FileHandler('errors.log', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+MAX_TOKENS = 2048
+
+def safe_log_string(text):
+    return text.encode('utf-8', errors='replace').decode('utf-8') if isinstance(text, str) else str(text)
+
+class State(TypedDict):
+    query: str
+    subject: str
+    latex_needed: bool
+    embeddings: List[Dict]
+    response_type: str
+    output: str
+    user_conversation: List[str]
+    ai_conversation: List[str]
+    context_ids: List[str]
+    parent_paragraph_id: List[str]
+    query_type: str
+    chunk_size_tokens: int
+    content_type: str
+    file_type: str
+    feedback: str
+    chapter: str
+
+summarize_template = PromptTemplate(
+    input_variables=['history', 'embeddings', 'query', 'subject'],
+    template="""Conversation history with subject context: {history}\n\nSubject: {subject}\n\nContent: {embeddings}\n\nSummarize the topic: {query}\n\n
+    Make sure the summary is precise, short, and understandable for a CBSE student. Adjust the summary to the user's query."""
+)
+
+brief_template = PromptTemplate(
+    input_variables=['history', 'embeddings', 'query', 'subject'],
+    template="""Conversation history with subject context: {history}\n\nSubject: {subject}\n\nContent: {embeddings}\n\nBriefly explain the topic: {query}\n\n
+    Make sure the explanation is precise and understandable for a CBSE student."""
+)
+
 practice_template = PromptTemplate(
     input_variables=['history', 'embeddings', 'query', 'subject'],
     template="""Conversation history with subject context: {history}\n\nSubject: {subject}\n\nContent: {embeddings}\n\ntopic: {query}\n\nProvide up to 5 practice questions for the topic\n\n
@@ -519,24 +581,75 @@ def create_workflow() -> CompiledStateGraph:
 
     return workflow.compile()
 
+
+
+app=FastAPI(title="Student AI tutor")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+    "http://localhost:3000",
+    "https://pm-ai-tool.vercel.app"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+@app.post('/chatbot')
+def chat_endpoint(request: ChatRequest):
+    """
+    Process a Jira-related query and return appropriate response
+    """
+    try:
+        # print(f"DEBUG - Received query: {request.query}")
+        state = {'query': request.query}
+        
+        # Test routing first
+        # route_selected = routing_query(request.query)
+        # print(f"DEBUG - Route selected: {route_selected}")
+        langgraph_app=create_workflow()
+        result = langgraph_app.invoke(state)
+        print(f"DEBUG - Final result: {result}")
+        
+        return {
+            "query": request.query,
+            "response": result.get('output', 'No response generated'),
+            # "route_used": route_selected,
+            "status": "success"
+        }
+    except Exception as e:
+        print(f"ERROR: {str(e)}")
+        return {
+            "query": request.query,
+            "error": str(e),
+            "status": "error"
+        }
+
 if __name__ == "__main__":
-    print("Welcome! Ask me any question about physics, chemistry, math, social science, or biology.")
-    print("Type 'exit' to quit.")
+    import uvicorn
+    import socket
     
-    app = create_workflow()
+    def find_free_port():
+        """Find a free port to use"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('', 0))
+            s.listen(1)
+            port = s.getsockname()[1]
+        return port
     
-    while True:
-        user_query = input("\nYour question: ")
-        
-        if user_query.lower() == 'exit':
-            print("Thank you for using the CBSE curriculum assistant!")
-            break
-            
-        if not user_query:
-            print("Response: Please enter a question.")
-            continue
-            
-        initial_state = initialize_state({"query": user_query})
-        result = app.invoke(initial_state)
-        
-        print(f"Response: {result['output']}")
+    # Check if running on Render (or other cloud platform)
+    is_production = os.environ.get("RENDER") or os.environ.get("PORT")
+    
+    if is_production:
+        port = int(os.environ.get("PORT", 8000))
+        host = "0.0.0.0"
+        print(f"Production mode: Starting server on {host}:{port}")
+        uvicorn.run("main:app", host=host, port=port)
+    else:
+        # For local development, find a free port
+        port = find_free_port()
+        host = "127.0.0.1"
+        print(f"Local development: Starting server on {host}:{port}")
+        print(f"Access your API at: http://localhost:{port}")
+        print(f"API docs available at: http://localhost:{port}/docs")
+        uvicorn.run("main:app", host=host, port=port, reload=True)
