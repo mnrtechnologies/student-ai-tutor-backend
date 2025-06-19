@@ -603,23 +603,20 @@ def read_root():
 @app.post('/chatbot')
 def chat_endpoint(request: ChatRequest):
     """
-    Process a Jira-related query and return appropriate response
+    Process a student query and return appropriate response
     """
     try:
-        # print(f"DEBUG - Received query: {request.query}")
-        state = {'query': request.query}
+        # Initialize state properly using the initialize_state function
+        state = initialize_state({'query': request.query})
         
-        # Test routing first
-        # route_selected = routing_query(request.query)
-        # print(f"DEBUG - Route selected: {route_selected}")
-        langgraph_app=create_workflow()
+        # Create and run the workflow
+        langgraph_app = create_workflow()
         result = langgraph_app.invoke(state)
         print(f"DEBUG - Final result: {result}")
         
         return {
             "query": request.query,
             "response": result.get('output', 'No response generated'),
-            # "route_used": route_selected,
             "status": "success"
         }
     except Exception as e:
@@ -629,7 +626,6 @@ def chat_endpoint(request: ChatRequest):
             "error": str(e),
             "status": "error"
         }
-
 if __name__ == "__main__":
     import uvicorn
     import socket
