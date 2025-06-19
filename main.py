@@ -8,6 +8,7 @@ from langchain.prompts import PromptTemplate
 from openai import OpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
+from pydantic import BaseModel
 
 # Configure logging to write only to debug.log
 logging.basicConfig(
@@ -595,6 +596,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the chatbot API"}
+
+class ChatRequest(BaseModel):
+    query: str
+
+
 @app.post('/chatbot')
 def chat_endpoint(request: ChatRequest):
     """
